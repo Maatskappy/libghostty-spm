@@ -72,8 +72,15 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// Thread-safe: acquires the same `NSLock` as `receive(_:)` and
     /// `setSurface(_:)`, preventing reads against a surface mid-replacement.
     public func readViewportText() -> String? {
+        // Snapshot the surface pointer under the lock, then release it BEFORE
+        // calling into ghostty: ghostty takes its own internal lock and can call
+        // back out (e.g. the resize callback → dispatchResize, which needs this
+        // lock). Holding `lock` across the C call is an ABBA deadlock. The lock
+        // only ever guarded the pointer value, not the surface's lifetime
+        // (ghostty_surface_free lives in TerminalSurface), so this is safe.
         lock.lock()
-        defer { lock.unlock() }
+        let surface = surface
+        lock.unlock()
         guard let surface else { return nil }
 
         let topLeft = ghostty_point_s(
@@ -120,8 +127,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// pinned to `VIEWPORT`), this reads the entire screen buffer — what callers
     /// like Inby's `inby server logs` need for full scrollback fidelity.
     public func readScrollbackText() -> String? {
+        // See readViewportText(): never hold `lock` across the ghostty call.
         lock.lock()
-        defer { lock.unlock() }
+        let surface = surface
+        lock.unlock()
         guard let surface else { return nil }
 
         let topLeft = ghostty_point_s(
@@ -161,8 +170,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// Whether the surface currently has a non-empty text selection.
     /// Non-destructive — does not touch the pasteboard.
     public func hasSelection() -> Bool {
+        // See readViewportText(): never hold `lock` across the ghostty call.
         lock.lock()
-        defer { lock.unlock() }
+        let surface = surface
+        lock.unlock()
         guard let surface else { return false }
         return ghostty_surface_has_selection(surface)
     }
@@ -172,8 +183,10 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// `AppTerminalView.copySelectedTextToPasteboard()`, this does not mutate
     /// the pasteboard. Same `ghostty_text_s` lifecycle as ``readViewportText()``.
     public func readSelectionText() -> String? {
+        // See readViewportText(): never hold `lock` across the ghostty call.
         lock.lock()
-        defer { lock.unlock() }
+        let surface = surface
+        lock.unlock()
         guard let surface else { return nil }
 
         var out = ghostty_text_s()
@@ -206,8 +219,15 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
 
     /// Feed data into the terminal from the host backend.
     public func receive(_ data: Data) {
+        // Snapshot the surface under the lock, then release it BEFORE writing to
+        // ghostty. ghostty_surface_write_buffer takes ghostty's internal lock
+        // and can synchronously fire the resize callback (→ dispatchResize),
+        // which needs this lock — holding it across the write is an ABBA deadlock
+        // (output + window resize). The lock only guarded the pointer, never the
+        // surface lifetime, so releasing it early is safe. See readViewportText().
         lock.lock()
-        defer { lock.unlock() }
+        let surface = surface
+        lock.unlock()
         guard let surface else {
             TerminalDebugLog.log(
                 .output,
