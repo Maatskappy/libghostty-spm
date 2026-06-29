@@ -108,6 +108,88 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         return String(decoding: bytes, as: UTF8.self)
     }
 
+    // MARK: - Scrollback Read (Inby fork addition)
+
+    /// Returns the full screen including scrollback history as a UTF-8 string,
+    /// or `nil` if no surface is attached. Lines are separated by `\n`. Same
+    /// `ghostty_text_s` lifecycle and locking as ``readViewportText()`` — the C
+    /// buffer is fully encapsulated.
+    ///
+    /// Selection grammar: `(SCREEN, TOP_LEFT)` to `(SCREEN, BOTTOM_RIGHT)` with
+    /// `rectangle: false` (linear flow). Unlike ``readViewportText()`` (which is
+    /// pinned to `VIEWPORT`), this reads the entire screen buffer — what callers
+    /// like Inby's `inby server logs` need for full scrollback fidelity.
+    public func readScrollbackText() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let surface else { return nil }
+
+        let topLeft = ghostty_point_s(
+            tag: GHOSTTY_POINT_SCREEN,
+            coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+            x: 0,
+            y: 0
+        )
+        let bottomRight = ghostty_point_s(
+            tag: GHOSTTY_POINT_SCREEN,
+            coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+            x: 0,
+            y: 0
+        )
+        let selection = ghostty_selection_s(
+            top_left: topLeft,
+            bottom_right: bottomRight,
+            rectangle: false
+        )
+
+        var out = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, selection, &out) else {
+            return nil
+        }
+        defer { ghostty_surface_free_text(surface, &out) }
+
+        guard let textPtr = out.text, out.text_len > 0 else {
+            return ""
+        }
+        let bytes = UnsafeBufferPointer(start: textPtr, count: Int(out.text_len))
+            .map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    // MARK: - Selection Read (Inby fork addition)
+
+    /// Whether the surface currently has a non-empty text selection.
+    /// Non-destructive — does not touch the pasteboard.
+    public func hasSelection() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let surface else { return false }
+        return ghostty_surface_has_selection(surface)
+    }
+
+    /// The current selection as a UTF-8 string, or `nil` if there is no surface
+    /// or no selection. Non-destructive — unlike
+    /// `AppTerminalView.copySelectedTextToPasteboard()`, this does not mutate
+    /// the pasteboard. Same `ghostty_text_s` lifecycle as ``readViewportText()``.
+    public func readSelectionText() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let surface else { return nil }
+
+        var out = ghostty_text_s()
+        guard ghostty_surface_read_selection(surface, &out) else {
+            return nil
+        }
+        defer { ghostty_surface_free_text(surface, &out) }
+
+        guard let textPtr = out.text, out.text_len > 0 else {
+            return ""
+        }
+        let bytes = UnsafeBufferPointer(start: textPtr, count: Int(out.text_len))
+            .map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
     func updateViewport(_ size: TerminalGridMetrics) {
         TerminalDebugLog.log(.metrics, "in-memory viewport update \(size.debugSummary)")
         dispatchResize(InMemoryTerminalViewport(
