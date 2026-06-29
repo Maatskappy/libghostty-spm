@@ -9,7 +9,19 @@ import Foundation
 import GhosttyKit
 
 public final class InMemoryTerminalSession: @unchecked Sendable {
+    /// Guards the `surface` pointer AND serializes all `ghostty_surface_*` calls
+    /// against each other — ghostty's surface is not safe for concurrent access,
+    /// so write (receive) and the viewport/scrollback/selection reads must never
+    /// run at the same time. Held across the ghostty call. Crucially this lock is
+    /// NOT taken by `dispatchResize` (see `resizeLock`): ghostty fires the resize
+    /// callback while holding its own internal surface lock, so if resize also
+    /// needed THIS lock it would deadlock (ABBA) against an in-flight write that
+    /// holds this lock and is waiting on ghostty's internal lock.
     private let lock = NSLock()
+    /// Separate lock for resize bookkeeping (`lastResize`) only — never held
+    /// across a ghostty call, never contends with `lock`. Keeps the resize
+    /// callback off the surface-serialization lock to avoid the ABBA above.
+    private let resizeLock = NSLock()
     private var surface: ghostty_surface_t?
     private var lastResize: InMemoryTerminalViewport?
     private let writeHandler: @Sendable (Data) -> Void
@@ -72,15 +84,11 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// Thread-safe: acquires the same `NSLock` as `receive(_:)` and
     /// `setSurface(_:)`, preventing reads against a surface mid-replacement.
     public func readViewportText() -> String? {
-        // Snapshot the surface pointer under the lock, then release it BEFORE
-        // calling into ghostty: ghostty takes its own internal lock and can call
-        // back out (e.g. the resize callback → dispatchResize, which needs this
-        // lock). Holding `lock` across the C call is an ABBA deadlock. The lock
-        // only ever guarded the pointer value, not the surface's lifetime
-        // (ghostty_surface_free lives in TerminalSurface), so this is safe.
+        // Hold `lock` across the ghostty call to serialize surface access
+        // against receive() and the other reads. Safe from ABBA because the
+        // resize callback uses `resizeLock`, not this one. See `lock`.
         lock.lock()
-        let surface = surface
-        lock.unlock()
+        defer { lock.unlock() }
         guard let surface else { return nil }
 
         let topLeft = ghostty_point_s(
@@ -127,10 +135,9 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// pinned to `VIEWPORT`), this reads the entire screen buffer — what callers
     /// like Inby's `inby server logs` need for full scrollback fidelity.
     public func readScrollbackText() -> String? {
-        // See readViewportText(): never hold `lock` across the ghostty call.
+        // See readViewportText(): hold `lock` across the ghostty call.
         lock.lock()
-        let surface = surface
-        lock.unlock()
+        defer { lock.unlock() }
         guard let surface else { return nil }
 
         let topLeft = ghostty_point_s(
@@ -170,10 +177,9 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// Whether the surface currently has a non-empty text selection.
     /// Non-destructive — does not touch the pasteboard.
     public func hasSelection() -> Bool {
-        // See readViewportText(): never hold `lock` across the ghostty call.
+        // See readViewportText(): hold `lock` across the ghostty call.
         lock.lock()
-        let surface = surface
-        lock.unlock()
+        defer { lock.unlock() }
         guard let surface else { return false }
         return ghostty_surface_has_selection(surface)
     }
@@ -183,10 +189,9 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// `AppTerminalView.copySelectedTextToPasteboard()`, this does not mutate
     /// the pasteboard. Same `ghostty_text_s` lifecycle as ``readViewportText()``.
     public func readSelectionText() -> String? {
-        // See readViewportText(): never hold `lock` across the ghostty call.
+        // See readViewportText(): hold `lock` across the ghostty call.
         lock.lock()
-        let surface = surface
-        lock.unlock()
+        defer { lock.unlock() }
         guard let surface else { return nil }
 
         var out = ghostty_text_s()
@@ -219,15 +224,13 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
 
     /// Feed data into the terminal from the host backend.
     public func receive(_ data: Data) {
-        // Snapshot the surface under the lock, then release it BEFORE writing to
-        // ghostty. ghostty_surface_write_buffer takes ghostty's internal lock
-        // and can synchronously fire the resize callback (→ dispatchResize),
-        // which needs this lock — holding it across the write is an ABBA deadlock
-        // (output + window resize). The lock only guarded the pointer, never the
-        // surface lifetime, so releasing it early is safe. See readViewportText().
+        // Hold `lock` across ghostty_surface_write_buffer to serialize surface
+        // access against the reads (snapshot/scrollback/selection) — ghostty's
+        // surface is not concurrency-safe. The resize callback uses `resizeLock`,
+        // NOT this lock, so this can't ABBA-deadlock against a window resize.
+        // See `lock`.
         lock.lock()
-        let surface = surface
-        lock.unlock()
+        defer { lock.unlock() }
         guard let surface else {
             TerminalDebugLog.log(
                 .output,
@@ -321,10 +324,15 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     }
 
     private func dispatchResize(_ resize: InMemoryTerminalViewport) {
-        lock.lock()
+        // Use `resizeLock`, NOT `lock`. ghostty fires this callback while holding
+        // its own internal surface lock; taking `lock` here would deadlock (ABBA)
+        // against an in-flight receive()/read that holds `lock` and is waiting on
+        // ghostty's internal lock. This body only touches `lastResize` (no surface
+        // / no ghostty call), so a separate lock is sufficient.
+        resizeLock.lock()
         let mergedResize = mergedResize(resize)
         guard mergedResize != lastResize else {
-            lock.unlock()
+            resizeLock.unlock()
             TerminalDebugLog.log(
                 .metrics,
                 "resize unchanged cols=\(mergedResize.columns) rows=\(mergedResize.rows) pixels=\(mergedResize.widthPixels)x\(mergedResize.heightPixels) cell=\(mergedResize.cellWidthPixels)x\(mergedResize.cellHeightPixels)"
@@ -332,7 +340,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             return
         }
         lastResize = mergedResize
-        lock.unlock()
+        resizeLock.unlock()
 
         TerminalDebugLog.log(
             .metrics,
