@@ -357,6 +357,21 @@ public final class TerminalSurface {
         ghostty_surface_free(s)
     }
 
+    /// Give up ownership of the raw surface WITHOUT freeing it, returning the
+    /// pointer so the new owner can dispose of it.
+    ///
+    /// Used at teardown to hand the surface to `InMemoryTerminalSession`, which
+    /// frees it once no `ghostty_surface_*` call is in flight. Freeing here
+    /// instead would race a feed parked inside `ghostty_surface_write_buffer`.
+    @discardableResult
+    func relinquish() -> ghostty_surface_t? {
+        guard !hasBeenFreed, let s = surface else { return nil }
+        TerminalDebugLog.log(.lifecycle, "surface relinquished")
+        hasBeenFreed = true
+        surface = nil
+        return s
+    }
+
     deinit {
         // Surface should be freed explicitly via free() before deinit.
         // The deinit safety net is intentionally removed because

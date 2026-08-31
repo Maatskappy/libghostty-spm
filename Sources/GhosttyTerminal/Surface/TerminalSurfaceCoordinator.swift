@@ -308,18 +308,36 @@ final class TerminalSurfaceCoordinator {
         }
     }
 
+    /// Detach and dispose of the surface.
+    ///
+    /// Runs on the main thread, including from `deinit` — and SwiftUI can drop
+    /// the last reference to the terminal view from something as ordinary as a
+    /// hover hit-test, so this must never block. It previously did: it called
+    /// `session.clearSurface`, which waited on the same lock a feed holds while
+    /// parked inside `ghostty_surface_write_buffer` on an occluded pane. That
+    /// write only unblocks when the pane becomes visible, and the pane is being
+    /// destroyed, so the main thread waited forever and the app hung.
+    ///
+    /// Disposal now goes through `InMemoryTerminalSession.retireSurface`, which
+    /// takes only the bookkeeping lock and defers the actual
+    /// `ghostty_surface_free` to whichever call drains last.
     private func tearDownSurface(removingBridgeFrom controller: TerminalController?) {
         TerminalDebugLog.log(.lifecycle, "tear down surface")
         tickScheduled = false
-        if let session = configuration.inMemorySession {
-            session.clearSurface(ifMatches: surface?.rawValue)
-        }
         controller?.onWakeup = nil
         controller?.shouldProcessWakeup = nil
         bridge.rawSurface = nil
         let hadSurface = surface != nil
         surface?.setFocus(false)
-        surface?.free()
+        if let session = configuration.inMemorySession {
+            if let raw = surface?.relinquish() {
+                session.retireSurface(raw)
+            } else {
+                session.clearSurface(ifMatches: nil)
+            }
+        } else {
+            surface?.free()
+        }
         surface = nil
         lastMetrics = nil
         pendingImmediateTick = true
