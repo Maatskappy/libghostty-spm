@@ -50,8 +50,11 @@ let package = Package(
         ),
         .binaryTarget(
             name: "libghostty",
-            url: "https://github.com/Lakr233/libghostty-spm/releases/download/upstream.82938b633ba6/GhosttyKit.xcframework.zip",
-            checksum: "2d9a26e80c3836c450f03ea2cf9d191841d9093d4f61c1cea466d2fc8e215dbb"
+            // Upstream's upstream.82938b633ba6 build, post-processed by
+            // Script/localize-runtime-symbols.sh so it links next to a Rust
+            // static library (duplicate ___isPlatformVersionAtLeast).
+            url: "https://github.com/Maatskappy/libghostty-spm/releases/download/inby.1.6.20260909/GhosttyKit.xcframework.zip",
+            checksum: "13ddf0946e368ff1a0c5953a7b54c1ef5787b1333fefedd9f6f2bbdd28cdbd22"
         ),
         .testTarget(
             name: "GhosttyKitTest",
