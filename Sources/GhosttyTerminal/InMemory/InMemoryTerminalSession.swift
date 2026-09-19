@@ -55,7 +55,8 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         surfaceWrite: @escaping InMemoryTerminalSurfaceAccess.Write,
         processExit: @escaping InMemoryTerminalSurfaceAccess.ProcessExit =
             InMemoryTerminalSession.reportProcessExit,
-        tick: @escaping InMemoryTerminalSurfaceAccess.Tick = { _ in }
+        tick: @escaping InMemoryTerminalSurfaceAccess.Tick = { _ in },
+        surfaceFree: @escaping InMemoryTerminalSurfaceAccess.Free = { _ in }
     ) {
         writeHandler = write
         resizeHandler = resize
@@ -63,7 +64,8 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         surfaceAccess = InMemoryTerminalSurfaceAccess(
             write: surfaceWrite,
             processExit: processExit,
-            tick: tick
+            tick: tick,
+            free: surfaceFree
         )
     }
 
@@ -87,6 +89,18 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         }
 
         TerminalDebugLog.log(.lifecycle, "in-memory session surface=nil matched")
+    }
+
+    /// Detach `surface` and free it once no operation on it is in flight,
+    /// without blocking on one that is parked. Teardown path; see
+    /// ``InMemoryTerminalSurfaceAccess/retireSurface(_:)``.
+    func retireSurface(_ surface: ghostty_surface_t) {
+        surfaceAccess.retireSurface(surface)
+        TerminalDebugLog.log(.lifecycle, "in-memory session surface retired")
+    }
+
+    var pendingRetiredSurfaceCount: Int {
+        surfaceAccess.pendingRetiredSurfaceCount
     }
 
     var currentSurface: ghostty_surface_t? {
@@ -148,6 +162,69 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             }
             return lines.joined(separator: "\n")
         } ?? nil
+    }
+
+    // MARK: - Scrollback Read (Inby fork addition)
+
+    /// Returns the whole screen, scrollback included, as a UTF-8 string, or
+    /// `nil` if no surface is attached. Unlike ``readViewportText()`` this is
+    /// a single `SCREEN`-tag read, so soft-wrapped rows are unwrapped into
+    /// their logical lines.
+    public func readScrollbackText() -> String? {
+        surfaceAccess.withCurrentSurface { surface -> String? in
+            let selection = ghostty_selection_s(
+                top_left: ghostty_point_s(
+                    tag: GHOSTTY_POINT_SCREEN,
+                    coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                    x: 0,
+                    y: 0
+                ),
+                bottom_right: ghostty_point_s(
+                    tag: GHOSTTY_POINT_SCREEN,
+                    coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                    x: 0,
+                    y: 0
+                ),
+                rectangle: false
+            )
+
+            var out = ghostty_text_s()
+            guard ghostty_surface_read_text(surface, selection, &out) else {
+                return nil
+            }
+            defer { ghostty_surface_free_text(surface, &out) }
+            return Self.string(from: out)
+        } ?? nil
+    }
+
+    // MARK: - Selection Read (Inby fork addition)
+
+    /// Whether the surface currently has a non-empty text selection.
+    /// Non-destructive — does not touch the pasteboard.
+    public func hasSelection() -> Bool {
+        surfaceAccess.withCurrentSurface { ghostty_surface_has_selection($0) } ?? false
+    }
+
+    /// The current selection as a UTF-8 string, or `nil` if there is no
+    /// surface or no selection. Non-destructive — unlike
+    /// `AppTerminalView.copySelectedTextToPasteboard()`, this does not mutate
+    /// the pasteboard.
+    public func readSelectionText() -> String? {
+        surfaceAccess.withCurrentSurface { surface -> String? in
+            var out = ghostty_text_s()
+            guard ghostty_surface_read_selection(surface, &out) else {
+                return nil
+            }
+            defer { ghostty_surface_free_text(surface, &out) }
+            return Self.string(from: out)
+        } ?? nil
+    }
+
+    private static func string(from text: ghostty_text_s) -> String {
+        guard let textPtr = text.text, text.text_len > 0 else { return "" }
+        let bytes = UnsafeBufferPointer(start: textPtr, count: Int(text.text_len))
+            .map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     func updateViewport(_ size: TerminalGridMetrics) {

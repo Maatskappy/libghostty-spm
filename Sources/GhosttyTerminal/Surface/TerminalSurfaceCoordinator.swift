@@ -530,10 +530,17 @@ final class TerminalSurfaceCoordinator {
         }
     }
 
+    /// Runs on the main thread, including from `deinit` — and SwiftUI can
+    /// drop the last reference to the terminal view from something as
+    /// ordinary as a hover hit-test — so it must never block. An in-memory
+    /// surface is therefore retired rather than cleared and freed: clearing
+    /// waits for in-flight writes, and a write parked on an occluded pane
+    /// only returns once the pane is visible again, which a pane being
+    /// destroyed never is.
     private func tearDownSurface(removingBridgeFrom controller: TerminalController?) {
         TerminalDebugLog.log(.lifecycle, "tear down surface")
         releaseDisplayLink()
-        surfaceSession?.clearSurface(ifMatches: surface?.rawValue)
+        let session = surfaceSession
         surfaceSession = nil
         controller?.removeWakeupObserver(ObjectIdentifier(self))
         // Must run before rawSurface is cleared: a clipboard-read
@@ -547,7 +554,15 @@ final class TerminalSurfaceCoordinator {
         bridge.rawSurface = nil
         let hadSurface = surface != nil
         surface?.setFocus(false)
-        surface?.free()
+        if let session {
+            if let raw = surface?.relinquish() {
+                session.retireSurface(raw)
+            } else {
+                session.clearSurface(ifMatches: nil)
+            }
+        } else {
+            surface?.free()
+        }
         surface = nil
         lastMetrics = nil
         syncedViewSize = nil
