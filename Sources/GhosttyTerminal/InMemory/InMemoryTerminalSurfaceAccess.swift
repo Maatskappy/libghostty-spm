@@ -6,6 +6,7 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
     typealias Write = @Sendable (ghostty_surface_t, Data) -> Void
     typealias ProcessExit = @Sendable (ghostty_surface_t, UInt32, UInt64) -> Void
     typealias Tick = @Sendable (ghostty_surface_t) -> Void
+    typealias Free = @Sendable (ghostty_surface_t) -> Void
 
     private let condition = NSCondition()
     private let outputQueue = DispatchQueue(
@@ -15,10 +16,34 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
     private let write: Write
     private let processExit: ProcessExit
     private let tick: Tick
+    private let free: Free
 
     private var surface: ghostty_surface_t?
     /// Prevents the caller from freeing a surface while a C operation uses it.
-    private var activeOperations = 0
+    ///
+    /// Counted per surface, not in total: a retired surface can keep a write
+    /// parked inside ghostty indefinitely, and that must not stall attaching
+    /// or clearing a different surface.
+    private var activeOperations: [ghostty_surface_t: Int] = [:]
+    /// Surfaces handed over by `retireSurface`. A `.deferred` one is freed by
+    /// whichever operation on it finishes last; a `.draining` one still
+    /// belongs to the `retireSurface` call that is waiting on it.
+    private var retiredSurfaces: [ghostty_surface_t: RetireState] = [:]
+    /// Held for a `.deferred` surface until its free: ghostty's IO thread
+    /// calls the session as unretained receive userdata until the free joins
+    /// it, so the session must outlive the surface.
+    private var retiredSurfaceOwners: [ghostty_surface_t: AnyObject] = [:]
+    private enum RetireState {
+        case draining
+        case deferred
+    }
+
+    /// How long a main-thread `retireSurface` ticks the app waiting for an
+    /// in-flight operation before it gives up and defers the free. Long
+    /// enough to drain a write that is only waiting on the mailbox; short
+    /// enough that a write parked for good costs one brief stall instead of
+    /// a hung app.
+    private static let retireDrainBudget: TimeInterval = 0.1
     /// Host output in arrival order, not yet handed to a surface. Each entry
     /// is consumed by whichever surface is attached when the output queue
     /// reaches it, so output queued behind a slow parse survives a surface
@@ -64,17 +89,19 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
         write: @escaping Write,
         processExit: @escaping ProcessExit,
         tick: @escaping Tick,
+        free: @escaping Free = { ghostty_surface_free($0) },
     ) {
         self.write = write
         self.processExit = processExit
         self.tick = tick
+        self.free = free
     }
 
     func setSurface(_ surface: ghostty_surface_t?) {
         condition.lock()
         let previous = self.surface
         self.surface = nil
-        waitForActiveOperations(ticking: previous)
+        waitForActiveOperations(on: previous)
         self.surface = surface
         // Drains scheduled while detached ran without consuming anything, so
         // give every waiting operation a drain of its own.
@@ -99,9 +126,63 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
         }
 
         surface = nil
-        waitForActiveOperations(ticking: expectedSurface)
+        waitForActiveOperations(on: expectedSurface)
         condition.unlock()
         return true
+    }
+
+    /// Detach `retired` and take ownership of freeing it, without waiting
+    /// for an operation that may never return.
+    ///
+    /// `clearSurface` waits for in-flight operations, and a write can park
+    /// inside `ghostty_surface_write_buffer` for good: an occluded pane
+    /// pauses its renderer, the input ring fills, and nothing drains it.
+    /// Teardown runs on the main thread — SwiftUI can drop the last
+    /// reference to the view from a hover hit-test — and the pane that
+    /// would unblock the write is the one being destroyed, so waiting there
+    /// hangs the app.
+    ///
+    /// Instead the pointer is detached at once, so later work waits for the
+    /// next surface. On the main thread the app is ticked for up to
+    /// ``retireDrainBudget`` in case the write only needs the mailbox
+    /// drained. After that the surface is freed by whichever operation on it
+    /// finishes last. Worst case is one leaked surface on a pane that was
+    /// already wedged.
+    func retireSurface(_ retired: ghostty_surface_t, keepingAlive owner: AnyObject? = nil) {
+        condition.lock()
+        if surface == retired {
+            surface = nil
+        }
+        // A tick below can deliver a close whose handler retires this same
+        // surface again; the outer call still owns it.
+        guard retiredSurfaces[retired] == nil else {
+            condition.unlock()
+            return
+        }
+        retiredSurfaces[retired] = .draining
+        if Thread.isMainThread {
+            waitForActiveOperations(
+                on: retired,
+                until: Date(timeIntervalSinceNow: Self.retireDrainBudget),
+            )
+        }
+        guard activeOperations[retired, default: 0] == 0 else {
+            retiredSurfaces[retired] = .deferred
+            retiredSurfaceOwners[retired] = owner
+            condition.unlock()
+            TerminalDebugLog.log(.lifecycle, "in-memory surface free deferred: operation in flight")
+            return
+        }
+        retiredSurfaces[retired] = nil
+        condition.unlock()
+        free(retired)
+    }
+
+    /// Retired surfaces still waiting on an in-flight operation.
+    var pendingRetiredSurfaceCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return retiredSurfaces.count
     }
 
     var currentSurface: ghostty_surface_t? {
@@ -168,10 +249,10 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
             condition.unlock()
             return nil
         }
-        activeOperations += 1
+        activeOperations[surface, default: 0] += 1
         condition.unlock()
 
-        defer { finishOperation() }
+        defer { finishOperation(on: surface) }
         return operation(surface)
     }
 
@@ -258,10 +339,10 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
             condition.unlock()
             return false
         }
-        activeOperations += 1
+        activeOperations[surface, default: 0] += 1
         condition.unlock()
 
-        defer { finishOperation() }
+        defer { finishOperation(on: surface) }
         switch operation {
         case let .write(data):
             write(surface, data)
@@ -287,29 +368,50 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
         return { handler(backlogged) }
     }
 
-    private func finishOperation() {
+    private func finishOperation(on surface: ghostty_surface_t) {
         condition.lock()
-        activeOperations -= 1
-        if activeOperations == 0 {
+        let remaining = activeOperations[surface, default: 1] - 1
+        activeOperations[surface] = remaining == 0 ? nil : remaining
+        var freeRetired = false
+        var owner: AnyObject?
+        if remaining == 0 {
             condition.broadcast()
+            if retiredSurfaces[surface] == .deferred {
+                retiredSurfaces[surface] = nil
+                owner = retiredSurfaceOwners.removeValue(forKey: surface)
+                freeRetired = true
+            }
         }
         let backlogChange = takeBacklogChange()
         condition.unlock()
+        if freeRetired {
+            TerminalDebugLog.log(.lifecycle, "in-memory deferred surface free")
+            free(surface)
+        }
         backlogChange?()
+        // Released only after the free has joined the IO thread.
+        withExtendedLifetime(owner) {}
     }
 
-    /// Called with the lock held. `previous` is the surface the in-flight
-    /// operations use; the caller frees it only after this returns.
-    private func waitForActiveOperations(ticking previous: ghostty_surface_t?) {
-        while activeOperations > 0 {
-            guard Thread.isMainThread, let previous else {
-                condition.wait()
+    /// Called with the lock held. `target` is the surface the in-flight
+    /// operations use; the caller frees it only after this returns. On the
+    /// main thread the app is ticked between waits. Returns early, with
+    /// operations possibly still in flight, once `deadline` passes.
+    private func waitForActiveOperations(
+        on target: ghostty_surface_t?,
+        until deadline: Date = .distantFuture,
+    ) {
+        guard let target else { return }
+        while activeOperations[target, default: 0] > 0, Date() < deadline {
+            guard Thread.isMainThread else {
+                _ = condition.wait(until: deadline)
                 continue
             }
-            _ = condition.wait(until: Date(timeIntervalSinceNow: Self.mainThreadPollInterval))
-            guard activeOperations > 0 else { return }
+            let slice = Date(timeIntervalSinceNow: Self.mainThreadPollInterval)
+            _ = condition.wait(until: min(slice, deadline))
+            guard activeOperations[target, default: 0] > 0 else { return }
             condition.unlock()
-            tick(previous)
+            tick(target)
             condition.lock()
         }
     }
